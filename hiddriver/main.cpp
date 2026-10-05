@@ -1205,6 +1205,7 @@ int HidRemoveDeviceHook(deviceHandle* deviceHandle2) {
 		DbgPrint("EINTIM: Removed virtual controller from XAM.\n");
 		return 0;
 	}
+	return 0;
 }
 
 int reportData = 0;
@@ -1360,10 +1361,15 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 		capabilities->Vibration.wRightMotorSpeed = 0;
 		return ERROR_SUCCESS;
 	}
+	return status;
 }
 
 NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXINPUT_GAMEPAD pInputData, PBOOL unk) {
-	if (dwDeviceContext >= 0x0000000010000005) {
+	// Only handle our own virtual controllers (contexts 0x10000005..0x10000008).
+	// XInputd routes by the top nibble of the context, and wired XInput pads
+	// (WGC driver) use 0x2000000x, so a bare ">= 0x10000005" also swallowed every
+	// wired controller and returned an error instead of its input.
+	if (dwDeviceContext >= 0x0000000010000005 && dwDeviceContext < 0x0000000010000005 + 4) {
 		if (!pInputData)
 			return ERROR_INVALID_PARAMETER;
 
@@ -1461,6 +1467,68 @@ NTSTATUS XInputdReadStateHook(DWORD dwDeviceContext, PDWORD pdwPacketNumber, PXI
 	return XInputdReadStateDetour.GetOriginal<decltype(&XInputdReadStateHook)>()(dwDeviceContext, pdwPacketNumber, pInputData, unk);
 }
 
+
+// ----------------------------------------------------------------------------
+// Third-party wired XInput pads (e.g. Flydigi Vader 4 Pro)
+//
+// The stock WGC (wired XInput) driver's interrupt-IN completion routine only
+// treats a transfer as an input report when exactly 20 bytes were received:
+//     lwz    r11, 0x24(r31)    ; actual length of the IN transfer
+//     lwz    r29, 0x1C(r31)    ; buffer
+//     cmplwi cr6, r11, 0x14
+//     stb    r10, 0x98(r31)
+//     bne    cr6, not_input    ; <-- patched to: blt cr6, not_input
+//     lbz    r11, 0(r29)       ; report type must be 0x00
+//     cmplwi r11, 0
+//     bne    not_input
+//     lbz    r11, 1(r29)       ; report length byte must be 0x14
+//     cmplwi cr6, r11, 0x14
+// Many third-party pads send longer transfers (the Vader 4 Pro sends 32 bytes:
+// the 20-byte report followed by motion data), so the pad binds to a player but
+// every input report is dropped. Accepting >= 20 bytes fixes it. The driver's IN
+// buffers are 64 bytes, genuine pads (exactly 20) are unaffected, and the
+// following 00 14 header check still filters out non-input messages.
+//
+// The instruction is located by pattern near the WgcAddDevice check that
+// UsbdSecPatch also uses, and only patched on an exact single match.
+// Verified on retail 17559 (patch lands at 0x800F9490).
+// ----------------------------------------------------------------------------
+#define WGC_ADDDEVICE_SITE_17559     0x800F98E0
+#define WGC_ADDDEVICE_SITE_17489_DEV 0x801341F4
+
+bool PatchWgcInputLengthCheck(bool devkit) {
+	DWORD site = devkit ? WGC_ADDDEVICE_SITE_17489_DEV : WGC_ADDDEVICE_SITE_17559;
+	DWORD start = (site & ~0xFFF) - 0x2000, end = (site & ~0xFFF) + 0x2000;
+	DWORD found = 0;
+	int matches = 0;
+
+	for (DWORD page = start; page < end; page += 0x1000) {
+		if (!MmIsAddressValid((PVOID)page))
+			return false;
+	}
+
+	for (DWORD a = start; a + 40 <= end; a += 4) {
+		DWORD* w = (DWORD*)a;
+		if (w[0] == 0x817F0024 && w[1] == 0x83BF001C && w[2] == 0x2B0B0014 && w[3] == 0x995F0098 &&
+			((w[4] & 0xFFFF0000) == 0x409A0000 || (w[4] & 0xFFFF0000) == 0x41980000) &&
+			w[5] == 0x897D0000 && w[6] == 0x280B0000 && (w[7] & 0xFFFF0000) == 0x40820000 &&
+			w[8] == 0x897D0001 && w[9] == 0x2B0B0014) {
+			found = a + 16;
+			matches++;
+		}
+	}
+
+	if (matches != 1) {
+		DbgPrint("EINTIM: WGC input length check not found (%d matches), not patching\n", matches);
+		return false;
+	}
+
+	DWORD before = *(DWORD*)found;
+	if ((before & 0xFFFF0000) == 0x409A0000)
+		*(DWORD*)found = 0x41980000 | (before & 0x0000FFFF); // bne cr6 -> blt cr6, same target
+	DbgPrint("EINTIM: WGC input length check patched at %p\n", found);
+	return true;
+}
 
 void* XamInputSetState = nullptr;
 void* XamInputGetCapabilitiesEx = nullptr;
@@ -1581,6 +1649,9 @@ BOOL APIENTRY DllMain(HANDLE Handle, DWORD Reason, PVOID Reserved) {
 
 		HidAddDeviceDetour.Install();
 		HidRemoveDeviceDetour.Install();
+
+		// Let third-party wired XInput pads that send >20-byte reports work
+		PatchWgcInputLengthCheck(isDevkit);
 
 		XamInputGetCapabilitiesDetour = Detour(XamInputGetCapabilitiesEx, (void*)XamInputGetCapabilitiesExHook);
 		XamInputSetStateDetour = Detour(XamInputSetState, (void*)XamInputSetStateHook);
