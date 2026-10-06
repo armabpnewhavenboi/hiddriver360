@@ -117,6 +117,15 @@ enum InitState
 };
 
 InitState g_InitState;
+
+// The HID init sequence below keeps its state in globals (c, globalIndex,
+// g_InitState, hidDescriptorBuffer, reportDescriptorBuffer), so only one HID
+// interface may be initialised at a time. Composite devices that expose several
+// HID interfaces at once (e.g. the Flydigi Vader 4 Pro dongle before it switches
+// to XInput) otherwise corrupt that state and freeze the console.
+volatile bool g_hidInitBusy = false;
+DWORD g_hidInitStart = 0;
+inline void HidInitFinished() { g_hidInitBusy = false; }
 #define USB_ENDPOINT_TYPE_CONTROL     0x00
 #define USB_ENDPOINT_TYPE_ISOCHRONOUS 0x01
 #define USB_ENDPOINT_TYPE_BULK        0x02
@@ -278,6 +287,8 @@ struct Controller {
 	// for nintendo specific handshake
 	NINTENDO_HANDSHAKE_STATE nintendo_handshake_state;
 	UsbTrb interruptTrb;
+
+	void* devDesc; // device descriptor of the USB device this controller belongs to
 } __declspec(align(4));
 
 struct MappingState {
@@ -399,6 +410,7 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 	if (status != 0) {
 		DbgPrint("EINTIM: Control transfer failed with status %x!\n", status);
 		g_InitState = INIT_FAILED;
+		HidInitFinished();
 		return status;
 	}
 
@@ -413,6 +425,7 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 		if (hidDescriptorBuffer.wDescriptorLength == 0) {
 			DbgPrint("EINTIM: ERROR - HID descriptor length is 0!\n");
 			g_InitState = INIT_FAILED;
+			HidInitFinished();
 			return -1;
 		}
 
@@ -443,16 +456,11 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 			hidDescriptorBuffer.wDescriptorLength,
 			&reportInfo);
 
-		c.reportInfo = reportInfo;
-		c.reportId = FindGamepadReportId(reportInfo);
-
-		DbgPrint("EINTIM: Parsed descriptor. UsingReportIDs: %d, Report ID: %d\r\n",
-			(int)reportInfo->UsingReportIDs, c.reportId);
-
 		if (parseResult != HID_PARSE_Successful || !reportInfo) {
 			DbgPrint("EINTIM: Failed to parse HID descriptor: error %d\r\n", parseResult);
 			g_InitState = InitState::INIT_FAILED;
 			free(reportDescriptorBuffer);
+			HidInitFinished();
 			return -1;
 		}
 
@@ -480,6 +488,7 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 
 		if (NT_ERROR(status)) {
 			DbgPrint("EINTIM: Failed to open interrupt endpoint %x!\n", status);
+			HidInitFinished();
 			return status;
 		}
 
@@ -502,6 +511,7 @@ int32_t setConfigurationComplete(DWORD deviceHandle, int32_t status) {
 		connectedControllers[globalIndex] = c;
 
 		DbgPrint("EINTIM: Registered virtual controller inside XAM with index: %d.\n", userIndex);
+		HidInitFinished();
 
 		if (NeedsDualshock3Handshake(c.vendorId, c.productId)) {
 			DbgPrint("EINTIM: Sending dualshock3 handshake!\r\n");
@@ -1240,6 +1250,28 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 			DbgPrint("EINTIM: ERROR - Invalid HID descriptor type %02x!\n", hid_descriptor->bDescriptorType);
 			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
 		}
+
+		// Devices that only pass through HID mode before re-enumerating as an
+		// XInput pad. Claiming them is pointless (and they expose several HID
+		// interfaces at once); the stock driver ignores them until they switch.
+		if (vendorId == 0x04B4 && productId == 0x2412) { // Flydigi Vader 4 Pro 2.4 GHz dongle (boot/HID mode)
+			DbgPrint("EINTIM: Flydigi dongle in HID mode, leaving it to the stock driver\n");
+			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
+		}
+
+		// One HID interface at a time (init state is global), and only one per device.
+		if (g_hidInitBusy && GetTickCount() - g_hidInitStart < 3000) {
+			DbgPrint("EINTIM: Another HID controller is initialising, leaving interface %d to the stock driver\n",
+				interface_descriptor->bInterfaceNumber);
+			return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
+		}
+		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+			if (connectedControllers[i].controllerDriver && connectedControllers[i].devDesc == (void*)device_descriptor) {
+				DbgPrint("EINTIM: Device already has a controller interface, leaving interface %d to the stock driver\n",
+					interface_descriptor->bInterfaceNumber);
+				return HidAddDeviceDetour.GetOriginal<decltype(&HidAddDeviceHook)>()(deviceHandle);
+			}
+		}
 		
 		int index = -1;
 		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
@@ -1264,6 +1296,7 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		c.productId = productId;
 		c.map = FindMapping(vendorId, productId);
 		c.nintendo_handshake_state = NINTENDO_HANDSHAKE_STATE::INITIAL;
+		c.devDesc = (void*)device_descriptor;
 
 		HidControllerExtension* controllerDriver = new HidControllerExtension();
 		c.deviceHandle = deviceHandle;
@@ -1287,6 +1320,8 @@ int HidAddDeviceHook(deviceHandle* deviceHandle) {
 		}
 
 		// Set device configuration (required for proper USB enumeration)
+		g_hidInitBusy = true;
+		g_hidInitStart = GetTickCount();
 		g_InitState = InitState::INIT_SET_CONFIGURATION;
 		DbgPrint("EINTIM: Sending SET_CONFIGURATION\n");
 		SendControlRequest(
